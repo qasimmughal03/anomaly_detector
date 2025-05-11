@@ -1,0 +1,14 @@
+streamlit
+langchain
+langgraph
+torch
+torchvision
+pytorch-msssim
+scikit-learn
+numpy
+pandas
+opencv-python-headless
+Pillow
+seaborn
+matplotlib
+scipy
