@@ -12,3 +12,4 @@ Pillow
 seaborn
 matplotlib
 scipy
+google-generativeai

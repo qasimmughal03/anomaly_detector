@@ -1,6 +1,6 @@
 {
-    "image_mse": 0.0007666244637221098,
-    "max_patch_mse": 0.0079728402197361,
-    "mahalanobis_distance": 7.114687986050107,
-    "hybrid_score": 0.13714517099987938
+    "image_mse": 0.0005883502890355885,
+    "max_patch_mse": 0.008266886696219444,
+    "mahalanobis_distance": 8.404083007929348,
+    "hybrid_score": 0.3767519076080279
 }

@@ -1,0 +1,27 @@
+{
+    "model_type_trained": "breast",
+    "params": {
+        "in_channels": 1,
+        "h_dim": 128,
+        "res_h_dim": 64,
+        "n_res_layers": 2,
+        "n_embeddings": 128,
+        "embedding_dim": 32,
+        "beta": 0.5,
+        "out_channels": 1
+    },
+    "img_size": 512,
+    "patch_size_ratio": 16,
+    "scaling_parameters_from_training": {
+        "mse_min_train": 5.408350261859596e-05,
+        "mse_max_train": 0.0017369819106534123,
+        "patch_mse_min_train": 0.000445245997980237,
+        "patch_mse_max_train": 0.05403852462768555,
+        "mahalanobis_min_train": 2.6751741916056613,
+        "mahalanobis_max_train": 13.861804974226745
+    },
+    "hybrid_score_weights_training": {
+        "patch_mse": 0.6,
+        "mahalanobis": 0.4
+    }
+}

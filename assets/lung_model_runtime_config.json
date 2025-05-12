@@ -1,0 +1,27 @@
+{
+    "model_type_trained": "lung",
+    "params": {
+        "in_channels": 1,
+        "h_dim": 128,
+        "res_h_dim": 64,
+        "n_res_layers": 2,
+        "n_embeddings": 128,
+        "embedding_dim": 32,
+        "beta": 0.25,
+        "out_channels": 1
+    },
+    "img_size": 256,
+    "patch_size_ratio": 16,
+    "scaling_parameters_from_training": {
+        "mse_min_train": 0.00044417515164241195,
+        "mse_max_train": 0.001589289982803166,
+        "patch_mse_min_train": 0.0028907768428325653,
+        "patch_mse_max_train": 0.026206735521554947,
+        "mahalanobis_min_train": 3.361228680172873,
+        "mahalanobis_max_train": 11.993227446143809
+    },
+    "hybrid_score_weights_training": {
+        "patch_mse": 0.6,
+        "mahalanobis": 0.4
+    }
+}
