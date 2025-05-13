@@ -29,6 +29,7 @@ ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 # --- LangGraph State Definition ---
 # ... (GraphState remains the same) ...
 class GraphState(TypedDict):
+    # --- Existing Fields ---
     image_bytes: Optional[bytes]
     image_filename: Optional[str]
     user_selected_type: str
@@ -45,18 +46,24 @@ class GraphState(TypedDict):
     mse_score_scaled: Optional[float]
     patch_mse_score_scaled: Optional[float]
     mahalanobis_score_scaled: Optional[float]
-    hybrid_score_pipeline: Optional[float]
+    hybrid_score_pipeline: Optional[float] # This is the VQ-VAE M0 score
+    threshold_hybrid_pipeline: Optional[float] # This is Th_VQVAE
     is_anomaly_mse: Optional[bool]
     threshold_mse: Optional[float]
     is_anomaly_patch_mse: Optional[bool]
     threshold_patch_mse: Optional[float]
     is_anomaly_mahalanobis: Optional[bool]
     threshold_mahalanobis: Optional[float]
-    is_anomaly: Optional[bool]
-    threshold_hybrid_pipeline: Optional[float]
     heatmap_pil: Optional[Image.Image]
     error_message: Optional[str]
 
+    # --- Updated/New Incremental Learning Fields ---
+    extracted_features: Optional[np.ndarray]       # Pooled features from M0 encoder
+    active_classifier: Optional[Any]             # The loaded CURRENT classifier model object
+    known_classes_for_classifier: Optional[List[str]] # Anomaly classes the active classifier knows (e.g., ['cancer'], ['benign', 'cancer'])
+    final_classification: Optional[str]          # Output: 'Normal', 'Cancer', 'Benign', 'Unknown_Anomaly', etc.
+    gt_label_needed: bool                        # Flag to signal UI to ask for label
+    buffer_counts: Optional[Dict[str, int]]      # To hold current buffer sizes
 
 # --- Helper Functions for Loading Assets ---
 # ... (load_json_file, load_vqvae_model, load_mahalanobis_scorer remain the same) ...
@@ -295,32 +302,64 @@ def vqvae_inference_node(state: GraphState) -> Dict[str, Any]:
         current_err = f"Failed to load VQVAE model from {model_p}."
         full_err = (err_msg + "; " if err_msg else "") + current_err
         return {"error_message": full_err}
-
+    
+    # Run inference
+    extracted_features_np = None # Initialize
+    reconstruction_tensor = None
+    latent_z_q_tensor = None
+    pixel_error_map = None
     # Run inference
     try:
         print("   Running VQ-VAE model inference...")
         with torch.no_grad():
-            _, recon, _, zq, _, _ = model(tensor)
+            # --- Modified model call ---
+            # Assuming forward now returns:
+            # vq_loss, x_recon, perplexity, z_q, z_e_pre_quant, min_encoding_indices
+            _, recon, _, zq, z_e_pre_quant, _ = model(tensor)
+            # --- End Modified model call ---
+
+            reconstruction_tensor = recon
+            latent_z_q_tensor = zq # Keep z_q if needed elsewhere
+
+            # --- Feature Extraction ---
+            if z_e_pre_quant is not None:
+                 print("   Extracting features from z_e_pre_quant...")
+                 # Pool features to a fixed size vector (e.g., [embedding_dim])
+                 pooled_features_tensor = torch.nn.functional.adaptive_avg_pool2d(z_e_pre_quant, (1, 1)).squeeze()
+                 # Ensure it's detached, on CPU, and numpy
+                 extracted_features_np = pooled_features_tensor.cpu().detach().numpy()
+                 print(f"   Extracted features shape: {extracted_features_np.shape}")
+            else:
+                 print("   Warning: z_e_pre_quant not available from model. Cannot extract features.")
+            # --- End Feature Extraction ---
+
         print("   Calculating pixel error map...")
-        px_err_map = compute_pixelwise_error_map(tensor, recon)
-        print("   VQ-VAE inference successful.")
+        # Ensure recon is valid before calculating error map
+        if reconstruction_tensor is not None:
+            pixel_error_map = compute_pixelwise_error_map(tensor, reconstruction_tensor)
+        else:
+            print("   Skipping pixel error map (no reconstruction).")
+
+        print("   VQ-VAE inference and feature extraction successful.")
         return {
-            "reconstructed_tensor": recon,
-            "latent_z_q": zq,
-            "pixel_error_map_np": px_err_map,
-            "error_message": err_msg if err_msg else None # Preserve any non-critical previous messages
+            "reconstructed_tensor": reconstruction_tensor,
+            "latent_z_q": latent_z_q_tensor,
+            "pixel_error_map_np": pixel_error_map,
+            "extracted_features": extracted_features_np, # Add features here
+            "error_message": err_msg if err_msg else None
          }
     except Exception as e:
-        current_err = f"Error during VQ-VAE model forward pass or pixel map calculation: {e}"
+        current_err = f"Error during VQ-VAE model forward pass, feature extraction, or pixel map calculation: {e}"
         print(f"   ERROR: {current_err}")
         full_err = (err_msg + "; " if err_msg else "") + current_err
-        # Return NaNs or None for outputs if inference fails
         return {
             "reconstructed_tensor": None,
             "latent_z_q": None,
             "pixel_error_map_np": None,
+            "extracted_features": None, # Ensure features are None on error
             "error_message": full_err
         }
+
 
 
 # --- calculate_raw_scores_node (Revised to use determined paths) ---
@@ -601,24 +640,39 @@ def apply_final_threshold_node(state: GraphState) -> Dict[str, Any]:
     }
 
 
-# --- generate_heatmap_node ---
-# Keep as is, but ensure it checks for errors
+# pipeline.py
+
 def generate_heatmap_node(state: GraphState) -> Dict[str, Any]:
     print("\n--- Node: generate_heatmap_node ---")
     orig_pil=state.get("original_pil")
     px_err_map=state.get("pixel_error_map_np")
     err_msg = state.get("error_message", "") # Get existing errors
-    is_anomaly = state.get("is_anomaly") # Check if anomaly was detected
+    final_classification = state.get("final_classification") # Get the final label
 
-    # Check if previous node already set an error or if not anomaly
+    # Check if previous node already set an error
     if err_msg:
         print(f"   Skipping heatmap generation due to previous error: {err_msg}")
         return {"error_message": err_msg, "heatmap_pil": None}
-    if not is_anomaly:
-         print(f"   Skipping heatmap generation as image was not flagged as an anomaly.")
-         # No error, just no heatmap needed
+
+    # --- Modified Condition ---
+    # Define which classifications count as "anomalous" for heatmap purposes
+    anomaly_labels_for_heatmap = [
+        "Cancer", "Benign",
+        "Potential_Anomaly_M0",
+        "Potential_Novel_Anomaly_C1",
+        "Potential_Unknown_Anomaly_C2",
+        "Potential_FP_C1", # Maybe show heatmap for potential FP too? Optional.
+        # Add Error states if you want heatmaps for them? e.g., "Error_Classification_Step"
+    ]
+
+    should_generate_heatmap = final_classification in anomaly_labels_for_heatmap
+    # --- End Modified Condition ---
+
+    if not should_generate_heatmap:
+         print(f"   Skipping heatmap generation (Final Classification: '{final_classification}' is not flagged for heatmap).")
          return {"error_message": err_msg if err_msg else None, "heatmap_pil": None}
 
+    # ... (rest of the heatmap generation logic remains the same) ...
     current_errs = []
     heatmap_pil_val = None
     if orig_pil and px_err_map is not None:
@@ -627,13 +681,9 @@ def generate_heatmap_node(state: GraphState) -> Dict[str, Any]:
             heatmap_pil_val = generate_heatmap_pil(orig_pil, px_err_map)
             print("   Heatmap generated successfully.")
         except Exception as e:
+            # ... (error handling as before) ...
             current_errs.append(f"Error during heatmap generation: {e}")
-            heatmap_pil_val = None # Ensure None on error
-    elif not orig_pil:
-         current_errs.append("Original PIL image missing for heatmap.")
-    elif px_err_map is None:
-         current_errs.append("Pixel error map missing for heatmap.")
-
+    # ...
 
     # Combine error messages
     node_err_msg = "; ".join(current_errs) if current_errs else None
@@ -703,82 +753,484 @@ def route_after_final_threshold(state: GraphState) -> str:
         print("Routing: apply_final_threshold -> END (Normal or Undetermined)")
         return END
 
+# --- Ensure il_utils functions are imported ---
+from il_utils import (
+    load_current_classifier, get_current_classifier_path, # Use current instead of C1/C2 path
+    load_known_classes, get_known_classes_path,
+    load_buffer, get_buffer_path
+)
+# ---
+
+# ... (other nodes) ...
+
+def load_active_classifier_node(state: GraphState) -> Dict[str, Any]:
+    """Loads the 'current' classifier and its known anomaly classes."""
+    print("\n--- Node: load_active_classifier_node ---")
+    img_type = state.get("determined_type")
+    config = state.get("model_config")
+    err_msg = state.get("error_message", "")
+
+    # Initialize outputs
+    active_classifier = None
+    known_classes = [] # Default to empty list (only knows Normal implicitly)
+    buffer_counts = {}
+
+    # --- Essential inputs check ---
+    if not img_type:
+        err_msg += "; Determined image type missing, cannot load classifier/state."
+        print("   Error: Determined image type missing.")
+    if not config:
+        err_msg += "; Model config missing, cannot determine feature dim for classifier."
+        print("   Error: Model config missing.")
+
+    # --- Load Known Classes State ---
+    if img_type:
+        print(f"   Loading known classes for {img_type}...")
+        known_classes = load_known_classes(img_type) # Returns [] if file not found/invalid
+        print(f"   Known anomaly classes: {known_classes}")
+    else:
+        err_msg += "; Skipping known classes loading (image type unknown)."
+
+    # --- Load Current Classifier (if it exists and config is known) ---
+    if img_type and config:
+        classifier_path = get_current_classifier_path(img_type)
+        if os.path.exists(classifier_path):
+            try:
+                input_dim = config["params"]["embedding_dim"]
+                # Number of classes = 1 (Normal) + number of known anomaly classes
+                num_classes = 1 + len(known_classes)
+                print(f"   Attempting to load current classifier for {img_type} ({num_classes} classes)...")
+
+                loaded_model = load_current_classifier(img_type, input_dim, num_classes, DEVICE)
+
+                if loaded_model:
+                     active_classifier = loaded_model
+                     # known_classes already loaded above
+                else:
+                     # load_current_classifier prints errors
+                     err_msg += f"; Failed to load existing current classifier ({os.path.basename(classifier_path)})"
+
+            except KeyError:
+                 err_msg += "; Cannot find 'embedding_dim' in model_config['params'] needed for classifier."
+                 print("   Error: embedding_dim missing in config.")
+            except Exception as e:
+                 err_msg += f"; Unexpected error during classifier loading: {e}"
+                 print(f"   Error: Unexpected classifier loading error: {e}")
+        else:
+            print(f"   No 'current' classifier file found for {img_type}. Using M0 only.")
+            # known_classes remains []
+
+    # --- Load Buffer Counts (Always attempt if img_type is known) ---
+    if img_type:
+        print(f"   Loading buffer counts for {img_type}...")
+        # Define potential anomaly types dynamically if needed, or hardcode known ones
+        anomaly_buffer_names = ["cancer_anomalies", "benign_anomalies"] # Add more if system grows
+        buffer_names_to_check = ["normal_replay", "false_positives"] + anomaly_buffer_names
+        for buffer_name in buffer_names_to_check:
+             buffer_path = get_buffer_path(buffer_name, img_type)
+             try: buffer_counts[buffer_name] = len(load_buffer(buffer_path))
+             except Exception as e:
+                  print(f"   W: Could not get count for {buffer_name}_{img_type}: {e}")
+                  buffer_counts[buffer_name] = 0
+        print(f"   Buffer Counts ({img_type}): {buffer_counts}")
+    else:
+        err_msg += "; Skipping buffer count loading (image type unknown)."
+
+
+    # Clean up error message formatting
+    final_err_msg = err_msg.strip("; ") if err_msg else None
+
+    return {
+        "active_classifier": active_classifier,
+        "known_classes_for_classifier": known_classes, # Store the loaded list
+        "buffer_counts": buffer_counts,
+        "error_message": final_err_msg
+    }
+
+# pipeline.py
+
+# pipeline.py
+
+# --- Add necessary imports ---
+import torch # Already imported
+import numpy as np # Already imported
+import torch.nn.functional as F_torch # Rename if needed
+# ---
+
+# --- Define Confidence Threshold ---
+CLASSIFIER_CONFIDENCE_THRESHOLD = 0.80 # Example value (tune later)
+# ---
+
+# ... (other nodes) ...
+
+def incremental_classification_node(state: GraphState) -> Dict[str, Any]:
+    """Performs classification using M0 or the dynamic 'current' classifier."""
+    print("\n--- Node: incremental_classification_node ---")
+
+    # Get inputs from state
+    hybrid_score = state.get("hybrid_score_pipeline") # M0 score
+    th_vqvae = state.get("threshold_hybrid_pipeline") # Th_VQVAE
+    features = state.get("extracted_features")
+    classifier = state.get("active_classifier") # The loaded current classifier
+    known_classes = state.get("known_classes_for_classifier") # List of known anomaly class names
+    err_msg = state.get("error_message", "")
+
+    # Initialize outputs
+    final_classification = "Error"
+    gt_label_needed = False
+
+    # --- Input Validation ---
+    if features is None:
+        err_msg += "; Extracted features missing for classification."
+        print("   Error: Features missing.")
+        return {"error_message": err_msg.strip("; "), "final_classification": final_classification, "gt_label_needed": True}
+
+    if known_classes is None: # Should be [] if none known, not None
+         known_classes = []
+         print("   Warning: known_classes_for_classifier was None, defaulting to [].")
+         # Don't add error yet, might just mean no IL state file exists
+
+    # Convert features to tensor
+    try:
+        features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    except Exception as e:
+         err_msg += f"; Failed to convert features to tensor: {e}."
+         print(f"   Error: Feature tensor conversion failed: {e}")
+         return {"error_message": err_msg.strip("; "), "final_classification": "Error_Feature_Conversion", "gt_label_needed": True}
+
+    # --- Classification Logic ---
+    is_m0_anomalous = hybrid_score is not None and th_vqvae is not None and hybrid_score > th_vqvae
+
+    try:
+        # Case 1: No classifier trained yet (known_classes is empty)
+        if classifier is None:
+            print("   Classifier: None (Using M0 only)")
+            # This check relies on load_active_classifier returning None if no file exists
+            if not known_classes: # Double check
+                 if is_m0_anomalous:
+                     final_classification = "Potential_Anomaly_M0"
+                     gt_label_needed = True
+                     print(f"   Result: M0 score {hybrid_score:.4f} > Th_VQVAE {th_vqvae:.4f} -> Potential Anomaly, Need Label")
+                 else:
+                     final_classification = "Normal"
+                     gt_label_needed = False
+                     print(f"   Result: M0 score {hybrid_score:.4f} <= Th_VQVAE {th_vqvae:.4f} -> Normal")
+            else:
+                 # Should not happen: known_classes has items but classifier is None
+                 err_msg += "; State inconsistency: Known classes exist but no classifier loaded."
+                 final_classification = "Error_State_Inconsistent"
+                 gt_label_needed = True
+
+
+        # Case 2: A classifier exists (handles dynamic number of classes)
+        else:
+            # Define the full list of class labels based on the known anomaly classes
+            # Consistent Order: Normal first, then sorted known anomaly classes
+            class_labels = ["Normal"] + sorted(known_classes)
+            num_expected_classes = 1 + len(known_classes)
+            print(f"   Classifier: Current ({num_expected_classes} classes: {class_labels})")
+
+            with torch.no_grad():
+                 outputs = classifier(features_tensor)
+                 # Check if output dimension matches expected number of classes
+                 if outputs.shape[-1] != num_expected_classes:
+                      err_msg += f"; Classifier output dimension ({outputs.shape[-1]}) != expected ({num_expected_classes}). Model/State mismatch?"
+                      final_classification = "Error_Classifier_Output_Mismatch"
+                      gt_label_needed = True
+                      # Need to return here, cannot proceed with prediction
+                      return {"error_message": err_msg.strip("; "), "final_classification": final_classification, "gt_label_needed": gt_label_needed}
+
+                 probs = F_torch.softmax(outputs, dim=1).squeeze().cpu().numpy()
+
+            pred_idx = np.argmax(probs)
+            pred_label = class_labels[pred_idx]
+            pred_prob = probs[pred_idx]
+            print(f"   Classifier Probs: { {lbl: f'{p:.4f}' for lbl, p in zip(class_labels, probs)} }")
+
+
+            if pred_prob >= CLASSIFIER_CONFIDENCE_THRESHOLD:
+                final_classification = pred_label # Confident prediction
+                gt_label_needed = False
+                print(f"   Result: Confident {pred_label} prediction by classifier.")
+                # Optional: Check M0 score for confident non-anomalous classifications
+                # if pred_label == "Normal" and is_m0_anomalous:
+                #    final_classification = "Potential_FP_Known" # Classifier says Normal, M0 says Anomaly
+                #    gt_label_needed = True # Ask for label
+                #    print(f"   Note: Confident Normal by Classifier, but M0 score high -> Potential FP, Need Label")
+
+            else:
+                 # Low confidence from the classifier
+                 if is_m0_anomalous:
+                    final_classification = "Potential_Novel_Anomaly" # Low Classifier conf + High M0 score
+                    gt_label_needed = True
+                    print(f"   Result: Low confidence from Classifier ({pred_label}?) and M0 score high -> Potential Novel, Need Label")
+                 else:
+                    final_classification = "Uncertain_Low_M0" # Low Classifier conf + Low M0 score
+                    gt_label_needed = True # Ask for label to clarify
+                    print(f"   Result: Low confidence from Classifier ({pred_label}?) and M0 score low -> Uncertain, Need Label")
+
+    except Exception as e: # This is the block that catches errors from the logic above
+        print(f"   Error: Classification failed: {e}") # This line prints the error you are seeing
+
+        # --- THIS IS THE FIX for the err_msg concatenation in THIS except block ---
+        current_node_error = f"; Error during classification logic: {e}."
+        err_msg = (err_msg if err_msg else "") + current_node_error
+        # --- END FIX ---
+
+        final_classification = "Error_Classification_Step"
+        gt_label_needed = True # Need expert review if classification fails
+
+    # This return block is outside the try/except
+    return {
+        "final_classification": final_classification,
+        "gt_label_needed": gt_label_needed,
+        "known_classes_for_classifier": known_classes,
+        "error_message": err_msg.strip("; ") if err_msg else None # Ensure stripping happens on a string
+    }
+
+# pipeline.py
+
+# --- Define Trigger Thresholds ---
+ANOMALY_TRIGGER_THRESHOLD = 7 # Use a single threshold for simplicity, or make it per-class
+# --- Define Potential Anomaly Classes & Buffers ---
+# List of anomaly class names that the system might learn
+POTENTIAL_ANOMALY_CLASSES = ["cancer", "benign"]
+# Map class name to buffer name convention
+ANOMALY_BUFFER_MAP = {
+    "cancer": "cancer_anomalies",
+    "benign": "benign_anomalies"
+    # Add more here if needed, e.g., "inflammation": "inflammation_anomalies"
+}
+# ---
+
+# --- Ensure il_utils imports for training/saving ---
+from il_utils import (
+    train_incremental_classifier, # The single training function
+    save_current_classifier,      # Function to save the newly trained classifier
+    save_known_classes,           # Function to update the known classes state
+    # Other needed functions like load_buffer, get_buffer_path etc. already imported
+)
+# ---
+
+# ... (other nodes) ...
+
+def check_trigger_training_node(state: GraphState) -> Dict[str, Any]:
+    """Checks buffers dynamically and triggers the incremental classifier training."""
+    print("\n--- Node: check_trigger_training_node ---")
+    buffer_counts = state.get("buffer_counts")
+    img_type = state.get("determined_type")
+    known_classes = state.get("known_classes_for_classifier") # Get list loaded earlier
+    config = state.get("model_config") # Needed for input_dim if training happens
+    err_msg = state.get("error_message", "")
+
+    if not buffer_counts or not img_type or known_classes is None or not config:
+         print("   Skipping training trigger check (missing buffer counts, type, known_classes, or config).")
+         return {"error_message": err_msg} # Pass existing errors
+
+    training_triggered = False
+    newly_known_classes = list(known_classes) # Copy to modify if training succeeds
+
+    # Loop through potential anomaly classes the system *could* learn
+    for anomaly_class_name in POTENTIAL_ANOMALY_CLASSES:
+        if anomaly_class_name not in known_classes: # Check if we *don't* already know this class
+            buffer_name = ANOMALY_BUFFER_MAP.get(anomaly_class_name)
+            if not buffer_name:
+                 print(f"   Warning: No buffer defined for potential anomaly class '{anomaly_class_name}'.")
+                 continue # Skip if buffer mapping is missing
+
+            current_count = buffer_counts.get(buffer_name, 0)
+
+            # Check trigger condition
+            if current_count >= ANOMALY_TRIGGER_THRESHOLD:
+                print(f"   *** TRIGGER TRAINING ({img_type}) ***")
+                print(f"   Reason: Buffer '{buffer_name}' count ({current_count}) >= threshold ({ANOMALY_TRIGGER_THRESHOLD})")
+                print(f"   New class to learn: '{anomaly_class_name}'")
+                print(f"   Currently known anomaly classes: {known_classes}")
+                training_triggered = True
+                NUM_EPOCHS = 100 # Example, adjust as needed
+                # --- Placeholder/Actual Training Call ---
+                try:
+                    print(f"   Initiating incremental training for {img_type} to add '{anomaly_class_name}'...")
+
+                    # ** Call the single dynamic training function **
+                    # Note: This call blocks the pipeline. Consider async execution.
+                    trained_model = train_incremental_classifier(
+                        img_type=img_type,
+                        new_anomaly_class=anomaly_class_name,
+                        currently_known_anomaly_classes=known_classes,
+                        device=DEVICE,
+                        epochs=NUM_EPOCHS
+                        # Pass other hyperparameters like epochs, lr if needed
+                    )
+
+                    if trained_model:
+                        # Save the newly trained model, overwriting the 'current' one
+                        save_current_classifier(img_type, trained_model)
+                        # Update the list of known classes
+                        newly_known_classes.append(anomaly_class_name)
+                        # Save the updated list of known classes state
+                        save_known_classes(img_type, newly_known_classes)
+                        print(f"   Incremental training for {img_type} completed.")
+                        print(f"   Classifier updated. Known anomaly classes now: {sorted(newly_known_classes)}")
+                        # Optional: Clear the buffer for the newly learned class?
+                        # buffer_path_to_clear = get_buffer_path(buffer_name, img_type)
+                        # save_buffer(buffer_path_to_clear, []) # Clears buffer
+                        # print(f"   Cleared buffer: {buffer_name}")
+
+                        # Since state changed, update known_classes for subsequent nodes if needed?
+                        # For simplicity, subsequent nodes in *this* run might not see update,
+                        # but the *next* image processed will load the new state.
+                    else:
+                         print(f"   Incremental training function failed for {img_type} adding '{anomaly_class_name}'.")
+                         err_msg += f"; Training failed for {img_type} adding '{anomaly_class_name}'"
+
+                except Exception as e:
+                     print(f"   ERROR during training trigger/call for {img_type} adding '{anomaly_class_name}': {e}")
+                     err_msg += f"; Training trigger failed for {img_type} adding '{anomaly_class_name}': {e}"
+
+                # Stop checking after the first trigger in a single run? Or allow multiple triggers?
+                # Let's stop after the first trigger for simplicity in one pipeline run.
+                break # Exit the loop once training is triggered/attempted
+        # else:
+             # print(f"   Class '{anomaly_class_name}' already known.") # Debugging
+
+    if not training_triggered:
+        print("   No new training trigger conditions met.")
+
+    # Pass state through, only modifying error message if training call failed
+    # We don't update known_classes in the *current run's state* here.
+    # The change is persisted to disk for the *next* run.
+    return {"error_message": err_msg.strip("; ") if err_msg else None}
+
+
+
+
+
 
 # --- Workflow Definition (Updated with new routes) ---
 workflow = StateGraph(GraphState)
 
 # Add nodes
+print("Adding nodes...")
 workflow.add_node("prepare_data", prepare_initial_data_node)
-workflow.add_node("vqvae_inference", vqvae_inference_node)
-workflow.add_node("calculate_raw_scores", calculate_raw_scores_node)
-workflow.add_node("evaluate_scaled_hybrid", evaluate_scaled_hybrid_node)
-workflow.add_node("apply_final_threshold", apply_final_threshold_node)
-workflow.add_node("generate_heatmap", generate_heatmap_node)
-workflow.add_node("error_handler", error_node) # Terminal node for errors
+workflow.add_node("vqvae_inference", vqvae_inference_node) # Now extracts features
+workflow.add_node("load_active_classifier", load_active_classifier_node) # New node
+workflow.add_node("calculate_raw_scores", calculate_raw_scores_node) # Keep M0 scores
+workflow.add_node("evaluate_scaled_hybrid", evaluate_scaled_hybrid_node) # Keep M0 scores
+workflow.add_node("incremental_classification", incremental_classification_node) # New node (replaces thresholding)
+workflow.add_node("check_trigger_training", check_trigger_training_node) # New node
+workflow.add_node("generate_heatmap", generate_heatmap_node) # Keep, will modify slightly
+workflow.add_node("error_handler", error_node) # Keep
 
 # Set entry point
+print("Setting entry point...")
 workflow.set_entry_point("prepare_data")
 
-# Define edges and conditional routing
+# --- Define Edges and Conditional Routing ---
+# Define reusable routing function based on error message
+def route_on_error(state: GraphState, next_node_success: str) -> str:
+    if state.get("error_message"):
+        print(f"Routing Error -> error_handler")
+        return "error_handler"
+    else:
+        print(f"Routing OK -> {next_node_success}")
+        return next_node_success
+
+print("Adding edges...")
+# 1. Prepare Data -> VQVAE Inference (or Error)
 workflow.add_conditional_edges(
     "prepare_data",
-    route_after_preparation,
+    lambda state: route_on_error(state, "vqvae_inference"),
     {"vqvae_inference": "vqvae_inference", "error_handler": "error_handler"}
 )
+
+# 2. VQVAE Inference -> Load Classifier (or Error)
 workflow.add_conditional_edges(
     "vqvae_inference",
-    route_after_vqvae,
+     lambda state: route_on_error(state, "load_active_classifier"),
+     {"load_active_classifier": "load_active_classifier", "error_handler": "error_handler"}
+)
+
+# 3. Load Classifier -> Calculate Raw Scores (or Error)
+# Classifier loading failure might add error but shouldn't stop flow yet
+workflow.add_conditional_edges(
+    "load_active_classifier",
+     lambda state: route_on_error(state, "calculate_raw_scores"),
      {"calculate_raw_scores": "calculate_raw_scores", "error_handler": "error_handler"}
 )
+
+# 4. Calculate Raw Scores -> Evaluate Scaled Hybrid (or Error)
 workflow.add_conditional_edges(
     "calculate_raw_scores",
-    route_after_scoring,
+     lambda state: route_on_error(state, "evaluate_scaled_hybrid"),
      {"evaluate_scaled_hybrid": "evaluate_scaled_hybrid", "error_handler": "error_handler"}
 )
+
+# 5. Evaluate Scaled Hybrid -> Incremental Classification (or Error)
 workflow.add_conditional_edges(
     "evaluate_scaled_hybrid",
-    route_after_evaluation,
-     {"apply_final_threshold": "apply_final_threshold", "error_handler": "error_handler"}
-)
-workflow.add_conditional_edges(
-    "apply_final_threshold",
-    route_after_final_threshold,
-    {"generate_heatmap": "generate_heatmap", END: END, "error_handler": "error_handler"}
+     lambda state: route_on_error(state, "incremental_classification"),
+     {"incremental_classification": "incremental_classification", "error_handler": "error_handler"}
 )
 
-# Final connections to END
+# 6. Incremental Classification -> Check Training Trigger (or Error)
+workflow.add_conditional_edges(
+    "incremental_classification",
+     lambda state: route_on_error(state, "check_trigger_training"),
+     {"check_trigger_training": "check_trigger_training", "error_handler": "error_handler"}
+)
+
+# 7. Check Training Trigger -> Generate Heatmap (or Error)
+# Always go to heatmap node after checking triggers; heatmap node decides if needed
+workflow.add_conditional_edges(
+    "check_trigger_training",
+     lambda state: route_on_error(state, "generate_heatmap"),
+     {"generate_heatmap": "generate_heatmap", "error_handler": "error_handler"}
+)
+
+# 8. Generate Heatmap -> END
+# Heatmap node doesn't branch, just adds heatmap to state if needed/possible
 workflow.add_edge("generate_heatmap", END)
-workflow.add_edge("error_handler", END) # Errors also terminate the graph
+
+# 9. Error Handler -> END
+workflow.add_edge("error_handler", END) # Errors terminate the graph
+
 
 # Compile the graph
+print("Compiling graph...")
 app_graph = workflow.compile()
+print("Graph compiled successfully.")
+# --- End Workflow Definition ---
 
-# --- run_analysis_pipeline Function ---
-# Keep as is
+# pipeline.py
+
+# ... (GraphState definition) ...
+
 def run_analysis_pipeline(image_bytes_input: bytes, image_filename_input: str, user_selected_type_input: str) -> GraphState:
     initial_state = GraphState(
+        # --- Existing Fields ---
         image_bytes=image_bytes_input, image_filename=image_filename_input, user_selected_type=user_selected_type_input,
         determined_type=None, model_config=None, original_pil=None, processed_tensor=None,
         reconstructed_tensor=None, latent_z_q=None, pixel_error_map_np=None,
-        mse_score=np.nan, patch_mse_score=np.nan, mahalanobis_score=np.nan, # Initialize scores to NaN
+        mse_score=np.nan, patch_mse_score=np.nan, mahalanobis_score=np.nan,
         mse_score_scaled=np.nan, patch_mse_score_scaled=np.nan, mahalanobis_score_scaled=np.nan,
-        hybrid_score_pipeline=np.nan,
+        hybrid_score_pipeline=np.nan, # M0 Score
+        threshold_hybrid_pipeline=np.nan, # Th_VQVAE
         is_anomaly_mse=None, threshold_mse=np.nan,
         is_anomaly_patch_mse=None, threshold_patch_mse=np.nan,
         is_anomaly_mahalanobis=None, threshold_mahalanobis=np.nan,
-        is_anomaly=None, threshold_hybrid_pipeline=np.nan,
-        heatmap_pil=None, error_message=None
+        heatmap_pil=None, error_message=None,
+
+        # --- Updated/New Incremental Learning Fields ---
+        extracted_features=None,
+        active_classifier=None,         # Initialize classifier object to None
+        known_classes_for_classifier=None, # Initialize known classes list to None
+        final_classification=None,      # Initialize final output label to None
+        gt_label_needed=False,         # Initialize ground truth needed flag to False
+        buffer_counts=None             # Initialize buffer counts to None
     )
+    # ... (rest of the function remains the same) ...
     print(f"\nInvoking pipeline for: {image_filename_input}, User Type Selection: {user_selected_type_input}")
-    # Increase recursion limit slightly if complex error paths might occur
     final_state = app_graph.invoke(initial_state, {"recursion_limit": 30})
-    print("-" * 50)
-    print(f"Pipeline finished for {image_filename_input}.")
-    final_error = final_state.get('error_message')
-    if final_error:
-         print(f"Pipeline completed with error(s): {final_error}")
-    else:
-         final_status = "Anomaly" if final_state.get('is_anomaly') else "Normal"
-         print(f"Pipeline completed successfully. Final Status: {final_status}")
-    print("-" * 50)
+    # ... (rest of the function remains the same) ...
     return final_state
