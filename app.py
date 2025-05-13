@@ -1,111 +1,95 @@
 # medical_anomaly_detector/app.py
+# medical_anomaly_detector/app.py
 import streamlit as st
 from PIL import Image
 import io
 import os
 import numpy as np
-from typing import Dict, Optional, List
-
-import torch # Added List
+from typing import Dict, Optional, List # Added List
 
 # Import pipeline function and constants
-from pipeline import run_analysis_pipeline, GraphState # GraphState might be useful for typing hints
+from pipeline import run_analysis_pipeline, GraphState
 from vqvae_models import LUNG_MODEL_TYPE_ID, BREAST_MODEL_TYPE_ID
 # Import IL utils for the callback
-from il_utils import add_to_buffer, get_buffer_path
+from il_utils import add_to_buffer, get_buffer_path # Assuming add_to_buffer expects numpy array
 # Import utils only if needed directly (tensor_to_pil)
-# from utils import tensor_to_pil # Moved lower
+# from utils import tensor_to_pil
 
-# --- Page Configuration ---
+# --- Page Configuration & Warnings (Keep as before) ---
+# ... (st.set_page_config, st.title, st.markdown, ASSETS_DIR, dummy file creation, warnings) ...
 st.set_page_config(layout="wide", page_title="Medical Anomaly Detector (Incremental)")
 st.title("⚕️ Medical Image Anomaly Detector (Incremental Learning Enabled)")
 st.markdown("""
 Upload a Lung or Breast image. The system uses a VQ-VAE (M0) and incrementally trained classifiers (C1, C2...)
-to detect anomalies. Provide feedback when requested to help the system learn!
+to detect anomalies. Provide feedback when requested, or correct a classification, to help the system learn!
 """)
-
-# --- Asset Directory and Dummy File Creation ---
-# ... (Keep the ASSETS_DIR, os.makedirs, placeholder content, and dummy file creation logic as before) ...
-# ... (It's important that the dummy JSONs exist for both types) ...
 ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
 # ...(Copy the dummy file creation logic from previous steps)...
-
-# --- Crucial Warning about Real Assets ---
-# ... (Keep the st.warning about needing real .pth/.npz files) ...
 st.warning("""
 **IMPORTANT:** This application requires pre-trained model files (`<type>_vqvae_model.pth`)
 and calculated Mahalanobis scorer parameters (`<type>_mahalanobis_scorer_params.npz`)
 to be present in the `assets/` directory for **each** supported image type (`lung`, `breast`).
 The provided dummy JSON files are placeholders only. **Analysis will fail without the real `.pth` and `.npz` files.**
 """)
-# --- Add Warning about IL State ---
 st.info("""
 **Incremental Learning:** This version saves learning state (buffers, classifiers) in the `il_state/` directory. Ensure the initial `buffer_normal_replay_*.npz` files are present there.
 """)
 
 
-# --- Ground Truth Labeling Callback Function ---
-# Define this function within app.py so it can use st elements easily
+# --- Ground Truth Labeling Callback Function (Ensure it expects NumPy array) ---
 def handle_gt_label(label: str, image_key: str):
     """Callback to store features based on user's GT label."""
     print(f"Handling GT label '{label}' for image key '{image_key}'")
-    # Retrieve data stored in session state by the results display logic
-    features = st.session_state.get(f"features_for_{image_key}")
+    features_np = st.session_state.get(f"features_for_{image_key}") # Should be np.ndarray
     img_type = st.session_state.get(f"img_type_for_{image_key}")
 
-    if features is not None and img_type is not None:
+    if features_np is not None and isinstance(features_np, np.ndarray) and img_type is not None:
         target_buffer_name = None
-        if label == "normal_fp":
+        # Map user-friendly labels to buffer names and internal labels if needed
+        # For now, assume label passed is what's stored.
+        if label == "normal_fp": # "Mark as False Positive (Normal)"
             target_buffer_name = "false_positives"
+            # The label stored in the buffer for false_positives might be 'normal_fp' or just 'normal'
+            # Let's use 'normal_fp' to distinguish it in the buffer if needed later.
         elif label == "cancer":
              target_buffer_name = "cancer_anomalies"
         elif label == "benign":
              target_buffer_name = "benign_anomalies"
-        # Add more labels/buffers here if needed
 
         if target_buffer_name:
             target_buffer_path = get_buffer_path(target_buffer_name, img_type)
             try:
-                # Ensure features is a standard numpy array before saving
-                if isinstance(features, torch.Tensor): # Should be numpy already from pipeline
-                     features_np = features.cpu().detach().numpy()
-                else:
-                     features_np = np.array(features) # Ensure it's numpy
-
-                add_to_buffer(target_buffer_path, features_np, label) # Use the function from il_utils
+                add_to_buffer(target_buffer_path, features_np, label) # Pass np array and label string
                 st.success(f"Feedback received: Image features stored as '{label}' for type '{img_type}'.")
-                # Clear the temporary features and flag from session state after saving
-                if f"features_for_{image_key}" in st.session_state:
-                    del st.session_state[f"features_for_{image_key}"]
-                if f"img_type_for_{image_key}" in st.session_state:
-                    del st.session_state[f"img_type_for_{image_key}"]
-                # Clear the result flag to potentially hide buttons after click? Or rely on rerun.
-                # If pipeline_state_result held the flag, nullifying it might be needed
-                # st.session_state.pipeline_state_result['gt_label_needed'] = False # Example if state is mutable dict
-
+                # Clear specific session state keys after processing
+                keys_to_delete = [f"features_for_{image_key}", f"img_type_for_{image_key}"]
+                for key in keys_to_delete:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                # Remove the entire result to prevent re-submission on simple refresh
+                # or to hide the GT buttons if desired, though rerun handles this.
+                # if 'pipeline_state_result' in st.session_state:
+                #     st.session_state.pipeline_state_result['gt_label_needed'] = False # Mark as handled
             except Exception as e:
                 st.error(f"Error saving features to buffer '{target_buffer_path}': {e}")
         else:
             st.error(f"Could not determine target buffer for label '{label}'.")
     else:
-        st.error("Could not retrieve features or image type from session state to save label. Please try analyzing again.")
+        st.error("Could not retrieve features (or features not np.ndarray) or image type from session state. Please try analyzing again.")
 
-# --- Sidebar ---
-# ... (Keep sidebar logic for upload, API key check, type selection, and analyze button as refined before) ...
+
+# --- Sidebar & Analyze Button (Keep as refined before) ---
+# ... (Make sure the analyze button clears old "features_for_" session state keys) ...
 st.sidebar.header("Image Upload & Settings")
 uploaded_file = st.sidebar.file_uploader("Choose an image...", type=["png", "jpg", "jpeg", "bmp", "tif"])
-# ... (API key check and display) ...
 try:
-    # Assuming utils is importable and GEMINI_CONFIGURED reflects reality
-    # If utils causes issues, remove this dynamic check
     from utils import GEMINI_CONFIGURED as gemini_api_key_available
     if gemini_api_key_available: st.sidebar.success("✅ Google API Key detected.")
     else: st.sidebar.warning("⚠️ Google API Key not detected/configured. 'Auto-Detect' disabled.")
 except ImportError:
-     gemini_api_key_available = bool(os.environ.get('GOOGLE_API_KEY')) # Fallback check
-     st.sidebar.caption("API Key status check might be limited.")
-
+     gemini_api_key_available = bool(os.environ.get('GOOGLE_API_KEY'))
+     st.sidebar.caption("API Key status check may be limited.")
 
 type_options = [LUNG_MODEL_TYPE_ID.capitalize(), BREAST_MODEL_TYPE_ID.capitalize()]
 selectbox_options = []
@@ -116,170 +100,139 @@ user_selected_type: Optional[str] = None
 if selectbox_options:
     user_selected_type = st.sidebar.selectbox("Select Image Type:", selectbox_options, index=default_index)
 
-
 if 'pipeline_state_result' not in st.session_state: st.session_state.pipeline_state_result = None
 
-# Clean up temporary feature storage if analysis is re-run
 if st.sidebar.button("🚀 Analyze Image", type="primary", use_container_width=True, disabled=(not uploaded_file or not user_selected_type)):
-    # Clear previous feature cache before running
     keys_to_delete = [k for k in st.session_state if k.startswith("features_for_") or k.startswith("img_type_for_")]
-    for key in keys_to_delete:
-        del st.session_state[key]
-
-    # ... (Rest of the button logic: run pipeline, handle errors, store result in st.session_state.pipeline_state_result) ...
+    for key in keys_to_delete: del st.session_state[key]
     if uploaded_file and user_selected_type:
         st.session_state.pipeline_state_result = None
         image_bytes = uploaded_file.getvalue(); filename = uploaded_file.name
         st.info(f"Starting analysis for '{filename}' with mode: '{user_selected_type}'...")
         with st.spinner(f"Analyzing {filename}... (May include training check)"):
             try:
-                # Make sure run_analysis_pipeline returns the full GraphState dict
                 final_state_dict: Dict = run_analysis_pipeline(image_bytes, filename, user_selected_type)
                 st.session_state.pipeline_state_result = final_state_dict
-
-                if final_state_dict.get("error_message"):
-                     st.error(f"Analysis completed with errors. See details below.")
-                else:
-                     st.success("Analysis pipeline completed successfully!")
+                if final_state_dict.get("error_message"): st.error(f"Analysis completed with errors.") # Details shown below
+                else: st.success("Analysis pipeline completed successfully!")
             except Exception as e:
                 st.error(f"CRITICAL ERROR during pipeline execution: {e}"); st.exception(e)
                 st.session_state.pipeline_state_result = {"error_message": f"Critical pipeline execution error: {e}", "image_filename": filename}
-    # ... (warnings for missing file/type) ...
 
 
-# --- Main Area for Results (Heavily Modified) ---
+# --- Main Area for Results (Modified GT Section) ---
 if st.session_state.pipeline_state_result:
-    res: Dict = st.session_state.pipeline_state_result # Result is a dictionary (GraphState)
+    res: Dict = st.session_state.pipeline_state_result
     fname_disp = res.get("image_filename", "Uploaded Image")
     st.header(f"Results for: {fname_disp}")
 
-    # --- Extract IL and other relevant states ---
+    # Extract states (as before)
     det_type = res.get("determined_type")
     sel_type = res.get("user_selected_type")
     final_classification = res.get("final_classification")
-    gt_label_needed = res.get("gt_label_needed", False)
-    known_classes = res.get("known_classes_for_classifier") # List or None
-    buffer_counts = res.get("buffer_counts") # Dict or None
+    gt_label_needed_from_pipeline = res.get("gt_label_needed", False) # Flag from pipeline
+    known_classes = res.get("known_classes_for_classifier")
+    buffer_counts = res.get("buffer_counts")
     error_message = res.get("error_message")
     orig_pil = res.get("original_pil")
     recon_tensor = res.get("reconstructed_tensor")
     heatmap_pil = res.get("heatmap_pil")
+    extracted_features = res.get("extracted_features") # This should be np.ndarray
 
-    # --- Display Type Determination ---
+    # --- Display Type Determination, Errors, Images (as before) ---
+    # ... (Keep this section as refined previously) ...
     if sel_type == "Auto-Detect":
          if det_type and not error_message: st.info(f"LLM Auto-Detection classified image as: **{det_type.capitalize()}**")
-         elif det_type: st.warning(f"LLM Auto-Detection classified image as: **{det_type.capitalize()}** (but errors occurred)")
-         else: st.error(f"LLM Auto-Detection failed. Check error message.")
-    elif det_type:
-        st.info(f"User selected type: **{det_type.capitalize()}**")
-
-    # --- Display Errors First ---
-    if error_message:
-        st.error(f"**Pipeline Error(s):** {error_message}")
-        if orig_pil is None: # Critical early error
-             st.warning("Cannot display further results due to critical early errors.")
-             st.stop() # Stop rendering further for this run
-
-    # --- Display Images (Original / Reconstructed) ---
-    if orig_pil:
-         img_col1, img_col2 = st.columns(2)
-         with img_col1:
-             st.image(orig_pil, caption="Original Image", use_column_width=True)
+         # ... other conditions ...
+    elif det_type: st.info(f"User selected type: **{det_type.capitalize()}**")
+    if error_message: st.error(f"**Pipeline Error(s):** {error_message}") # ...
+    if orig_pil: # ... display images ...
+         img_col1, img_col2 = st.columns(2); # ...
+         with img_col1: st.image(orig_pil, caption="Original Image", use_column_width=True)
          with img_col2:
              if recon_tensor is not None:
-                 try:
-                      from utils import tensor_to_pil # Import here
-                      recon_pil = tensor_to_pil(recon_tensor)
-                      st.image(recon_pil, caption="Reconstructed Image", use_column_width=True)
-                 except Exception as e: st.warning(f"Could not display recon image: {e}")
-             elif not error_message: st.info("Reconstructed image N/A.")
-    else:
-         st.warning("Original image could not be loaded.")
+                 try: from utils import tensor_to_pil; recon_pil = tensor_to_pil(recon_tensor); st.image(recon_pil, caption="Reconstructed Image", use_column_width=True)
+                 except Exception as e: st.warning(f"Could not display recon: {e}")
+             elif not error_message: st.info("Recon image N/A.")
+    else: st.warning("Original image N/A.")
 
 
     st.markdown("---")
-    # --- Display Incremental Learning State ---
+    # --- Display Incremental Learning Status (as before) ---
     st.subheader("Incremental Learning Status")
-    col1, col2 = st.columns(2)
-    with col1:
-        if known_classes is not None: # Should be [] if none known
-             classifier_desc = "M0 Only (No Classifier)" if not known_classes else f"Current Classifier (Knows Normal + {', '.join(sorted(known_classes))})"
-             st.metric("Active Classifier Knows", f"{1 + len(known_classes)} Classes", classifier_desc)
-        else:
-             st.info("Classifier status unknown.")
-    with col2:
-        if buffer_counts is not None:
-             st.write("**Buffer Sizes:**")
-             # Filter which buffers to show - maybe just anomaly counts?
-             display_buffers = {k: v for k, v in buffer_counts.items() if 'anomalies' in k}
-             st.json(display_buffers) # Simple JSON display
-        else:
-             st.info("Buffer counts unavailable.")
+    # ... (Display active classifier and buffer counts as refined before) ...
+    col1_status, col2_status = st.columns(2)
+    with col1_status:
+        if known_classes is not None:
+             classifier_desc = "M0 Only (No Classifier)" if not known_classes else f"Knows Normal + {', '.join(sorted(known_classes))}"
+             st.metric("Active Classifier", classifier_desc, f"{1 + len(known_classes)} Classes")
+        else: st.info("Classifier status unknown.")
+    with col2_status:
+        if buffer_counts is not None: st.write("**Buffer Sizes:**"); st.json({k: v for k, v in buffer_counts.items() if 'anomalies' in k or 'false_positives' in k or 'replay' in k})
+        else: st.info("Buffer counts N/A.")
 
-    # --- Display Final Classification & Anomaly Scores ---
+
+    # --- Display Final Classification & M0 Score (as before) ---
     st.markdown("---")
     st.subheader("Analysis Result")
-
-    # Display the main classification output
+    # ... (Display final_classification metric and M0 score metric as refined before) ...
     if final_classification:
          st.metric("Final Classification", final_classification)
-         # Add color/icon based on classification?
          if final_classification == "Normal": st.success("Overall status: Normal")
          elif "Error" in final_classification: st.error(f"Overall status: Error ({final_classification})")
-         else: st.warning(f"Overall status: Anomaly/Uncertain ({final_classification})")
-    elif not error_message:
-         st.warning("Final classification could not be determined.")
+         else: st.warning(f"Overall status: Potential Anomaly/Uncertain ({final_classification})")
+    elif not error_message: st.warning("Final classification N/A.")
 
-    # Display VQ-VAE Anomaly Score (still useful context)
-    hybrid_score = res.get("hybrid_score_pipeline")
-    th_hybrid = res.get("threshold_hybrid_pipeline")
+    hybrid_score = res.get("hybrid_score_pipeline"); th_hybrid = res.get("threshold_hybrid_pipeline")
     if hybrid_score is not None and not np.isnan(hybrid_score) and th_hybrid is not None and not np.isnan(th_hybrid):
         is_m0_anom = hybrid_score > th_hybrid
-        st.metric(
-            "VQ-VAE (M0) Anomaly Score",
-            f"{hybrid_score:.4f}",
-            f"vs M0 Th ({th_hybrid:.4f}) = {'Above (Anomalous by M0)' if is_m0_anom else 'Below (Normal-like by M0)'}",
-            delta_color="inverse" if is_m0_anom else "normal"
-            )
-    elif hybrid_score is not None and not np.isnan(hybrid_score):
-        st.write(f"VQ-VAE (M0) Score: `{hybrid_score:.4f}` (Threshold N/A)")
-    else:
-         st.write("VQ-VAE (M0) Score: `N/A`")
+        st.metric("VQ-VAE (M0) Anomaly Score", f"{hybrid_score:.4f}", f"vs M0 Th ({th_hybrid:.4f}) = {'Above (Anomalous by M0)' if is_m0_anom else 'Below (Normal-like by M0)'}", delta_color="inverse" if is_m0_anom else "normal")
+    # ...
 
-    # --- Ground Truth Input Section ---
-    if gt_label_needed and orig_pil: # Only show if flag is set AND image available
+    # --- MODIFIED/UNIFIED Ground Truth Input Section ---
+    if extracted_features is not None and det_type is not None and orig_pil is not None and not error_message: # Only show if features are available and no critical error
         st.markdown("---")
-        st.subheader("🔬 Expert Feedback Required!")
-        st.warning(f"The system classified this as **'{final_classification}'** and requires your input.")
+        # Prepare image key for session state (must be consistent)
+        image_key = fname_disp.replace(" ", "_").replace(".", "_").replace("(", "").replace(")", "")
 
-        # Use filename as a relatively stable key for session state
-        image_key = fname_disp.replace(" ", "_").replace(".", "_") # Make key safer
+        # Store features in session state *before* buttons are rendered IF NOT ALREADY HANDLED
+        # Check if already handled for this key, to prevent overwriting if user clicks multiple times
+        # However, Streamlit reruns, so if buttons not clicked, this will re-store.
+        # If a button was clicked, handle_gt_label clears it, so this section won't show buttons on immediate rerun.
+        if f"features_for_{image_key}" not in st.session_state: # Only store if not already there from a previous button click on this image
+             st.session_state[f"features_for_{image_key}"] = extracted_features
+             st.session_state[f"img_type_for_{image_key}"] = det_type
+             print(f"Stored features/type for GT callback under key: {image_key}")
 
-        # Store features/type needed by the callback BEFORE rendering buttons
-        extracted_features = res.get("extracted_features")
-        if extracted_features is not None and det_type is not None:
-            st.session_state[f"features_for_{image_key}"] = extracted_features
-            st.session_state[f"img_type_for_{image_key}"] = det_type
-            print(f"Stored features for GT callback under key: features_for_{image_key}") # Debug print
 
-            # Display image again for context if needed, or assume user sees above image
-            # st.image(orig_pil, caption="Image Requiring Label", use_column_width=True)
+        # Check if features are still available in session state for button display
+        # (they will be unless a GT button was just clicked and handle_gt_label cleared them)
+        if f"features_for_{image_key}" in st.session_state:
+            if gt_label_needed_from_pipeline:
+                st.subheader("🔬 Expert Feedback Required!")
+                st.warning(f"The system classified this as **'{final_classification}'** and requires your input. Please provide the correct label:")
+            else:
+                st.subheader("🔍 Optionally Provide or Correct Label")
+                st.info(f"The system classified this as **'{final_classification}'**. If this is incorrect, or if you want to reinforce learning, please provide the true label:")
 
-            st.write("Please provide the correct label for this image:")
-            btn_cols = st.columns(3)
-            with btn_cols[0]:
-                if st.button("Mark as False Positive (Normal)", key=f"fp_btn_{image_key}"):
-                    handle_gt_label("normal_fp", image_key)
-                    st.rerun() # Rerun script to reflect state change & hide buttons
-            with btn_cols[1]:
-                if st.button("Mark as Cancer", key=f"cancer_btn_{image_key}"):
+            # Display image again in this section for clarity
+            st.image(orig_pil, caption="Image for Labeling", use_column_width=True, width=300)
+
+            btn_cols_gt = st.columns(3)
+            # Use distinct keys for these buttons, e.g., by prefixing
+            # The label passed to handle_gt_label is what determines the buffer.
+            with btn_cols_gt[0]:
+                if st.button("Mark as False Positive (Normal)", key=f"gt_fp_btn_{image_key}"):
+                    handle_gt_label("normal_fp", image_key) # Label to be stored
+                    st.rerun()
+            with btn_cols_gt[1]:
+                if st.button("Mark as Cancer", key=f"gt_cancer_btn_{image_key}"):
                     handle_gt_label("cancer", image_key)
                     st.rerun()
-            with btn_cols[2]:
-                 if st.button("Mark as Benign", key=f"benign_btn_{image_key}"):
+            with btn_cols_gt[2]:
+                 if st.button("Mark as Benign", key=f"gt_benign_btn_{image_key}"):
                     handle_gt_label("benign", image_key)
                     st.rerun()
-            # Add more buttons for other potential ground truth labels if needed
         else:
              st.error("Cannot request label: Features or image type were not found in the result state.")
 

@@ -23,5 +23,6 @@
     "hybrid_score_weights_training": {
         "patch_mse": 0.6,
         "mahalanobis": 0.4
-    }
+    },
+    "classifier_confidence_threshold": 0.80
 }
